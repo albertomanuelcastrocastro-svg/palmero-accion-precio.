@@ -1,18 +1,7 @@
 """
-PALMERO - Especialista en Accion del Precio
+PALMERO - Especialista en Accion del Precio (CON AUTENTICACION)
 =============================================
-Servicio independiente que analiza velas (OHLC) por simbolo y timeframe:
-- Vela actual (en formacion) y vela anterior (cerrada)
-- Patron detectado en la vela cerrada (martillo, envolvente, doji, etc.)
-- Tamano relativo de cuerpo y mechas
-- Posicion respecto al rango reciente (cerca de maximos/minimos)
-- Timestamps de apertura/cierre de cada vela y de generacion de la respuesta
-
-No depende de los servicios existentes (superb-growth, sincere-gentleness,
-palmero-divergencias). Expone un endpoint JSON que Claude puede consultar
-bajo demanda (pegando el link en el chat).
-
-Despliegue: Railway, como servicio nuevo independiente.
+Versión segura con API key authentication.
 """
 
 import os
@@ -20,9 +9,31 @@ import time
 import requests
 import numpy as np
 from datetime import datetime, timezone
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
+
+# ============================================================
+# AUTENTICACION
+# ============================================================
+API_KEY = os.environ.get("PALMERO_API_KEY", "default-change-me")
+
+def check_auth():
+    """Verifica que el request tenga la API key correcta."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return False
+    token = auth_header[7:]  # Quita "Bearer "
+    return token == API_KEY
+
+def require_auth(f):
+    """Decorador para proteger endpoints."""
+    def decorated(*args, **kwargs):
+        if not check_auth():
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    decorated.__name__ = f.__name__
+    return decorated
 
 # Configuracion
 SYMBOLS = ["XRPUSDT", "SOLUSDT"]
@@ -34,15 +45,14 @@ TIMEFRAMES = {
     "4h": "4h",
 }
 BINANCE_BASE = "https://data-api.binance.vision/api/v3/klines"
-NUM_VELAS = 30  # ventana para contexto y rango reciente
+NUM_VELAS = 30
 
-# Cache simple en memoria (evita golpear Binance en cada request)
 _cache = {}
-_cache_ttl = 20  # segundos
+_cache_ttl = 20
 
 
 def fetch_klines(symbol, interval, limit=NUM_VELAS):
-    """Descarga velas OHLCV de Binance publico, incluyendo la vela en curso."""
+    """Descarga velas OHLCV de Binance publico."""
     key = (symbol, interval)
     now = time.time()
     if key in _cache and now - _cache[key]["ts"] < _cache_ttl:
@@ -52,14 +62,13 @@ def fetch_klines(symbol, interval, limit=NUM_VELAS):
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     raw = resp.json()
-    # raw[-1] es la vela actual (en formacion), raw[-2] es la ultima cerrada
 
     _cache[key] = {"ts": now, "data": raw}
     return raw
 
 
 def vela_to_dict(k):
-    """Convierte una vela cruda de Binance a un diccionario con OHLCV y tiempos."""
+    """Convierte una vela cruda de Binance a un diccionario."""
     open_time = int(k[0])
     close_time = int(k[6])
     return {
@@ -74,10 +83,7 @@ def vela_to_dict(k):
 
 
 def detectar_patron(vela):
-    """
-    Detecta patrones basicos de una sola vela a partir de OHLC.
-    Devuelve (patron, detalle) donde detalle incluye tamanos relativos.
-    """
+    """Detecta patrones basicos de una sola vela."""
     o, h, l, c = vela["open"], vela["high"], vela["low"], vela["close"]
     rango_total = h - l
     if rango_total == 0:
@@ -103,19 +109,12 @@ def detectar_patron(vela):
         "alcista": alcista,
     }
 
-    # Doji: cuerpo muy pequeno
     if cuerpo_pct <= 10:
         return "doji", detalle
-
-    # Martillo: mecha inferior grande (>=50%), cuerpo pequeno (<=35%), mecha superior pequena (<=10%)
     if mecha_inf_pct >= 50 and cuerpo_pct <= 35 and mecha_sup_pct <= 10:
         return "martillo", detalle
-
-    # Estrella fugaz / martillo invertido: mecha superior grande, cuerpo pequeno, mecha inferior pequena
     if mecha_sup_pct >= 50 and cuerpo_pct <= 35 and mecha_inf_pct <= 10:
         return "estrella_fugaz", detalle
-
-    # Marubozu: cuerpo ocupa casi todo el rango (>=90%)
     if cuerpo_pct >= 90:
         return "marubozu_alcista" if alcista else "marubozu_bajista", detalle
 
@@ -123,10 +122,7 @@ def detectar_patron(vela):
 
 
 def detectar_envolvente(vela_actual, vela_anterior):
-    """
-    Detecta si la vela cerrada mas reciente es una envolvente
-    (alcista o bajista) respecto a la anterior a ella.
-    """
+    """Detecta envolvente alcista o bajista."""
     o1, c1 = vela_anterior["open"], vela_anterior["close"]
     o2, c2 = vela_actual["open"], vela_actual["close"]
 
@@ -149,12 +145,8 @@ def detectar_envolvente(vela_actual, vela_anterior):
 
 
 def posicion_en_rango(precio, velas, window=20):
-    """
-    Calcula en que punto del rango reciente (maximo/minimo de las
-    ultimas `window` velas cerradas) se encuentra el precio actual.
-    Devuelve un porcentaje: 0 = en el minimo, 100 = en el maximo.
-    """
-    cerradas = velas[-(window + 1):-1]  # excluye la vela en curso
+    """Calcula posicion en rango reciente."""
+    cerradas = velas[-(window + 1):-1]
     if len(cerradas) < 2:
         return None
 
@@ -180,9 +172,9 @@ def analizar_simbolo_tf(symbol, tf_label, interval):
     if len(raw) < 3:
         return {"error": "datos_insuficientes"}
 
-    vela_actual_raw = raw[-1]   # en formacion
-    vela_cerrada_raw = raw[-2]  # ultima cerrada
-    vela_previa_raw = raw[-3]   # anterior a la cerrada (para envolvente)
+    vela_actual_raw = raw[-1]
+    vela_cerrada_raw = raw[-2]
+    vela_previa_raw = raw[-3]
 
     vela_actual = vela_to_dict(vela_actual_raw)
     vela_cerrada = vela_to_dict(vela_cerrada_raw)
@@ -212,6 +204,7 @@ def analizar_simbolo_tf(symbol, tf_label, interval):
 
 
 @app.route("/precio/<symbol>")
+@require_auth
 def precio_symbol(symbol):
     symbol = symbol.upper()
     if symbol not in SYMBOLS:
@@ -232,6 +225,7 @@ def precio_symbol(symbol):
 
 
 @app.route("/precio")
+@require_auth
 def precio_todos():
     resultado = {"timestamp_utc": datetime.now(timezone.utc).isoformat()}
     for symbol in SYMBOLS:
@@ -247,12 +241,8 @@ def precio_todos():
 @app.route("/")
 def home():
     return jsonify({
-        "servicio": "PALMERO - Accion del Precio",
-        "endpoints": [
-            "/precio - todos los simbolos y timeframes",
-            "/precio/<symbol> - ej. /precio/XRPUSDT",
-        ],
-        "nota": "vela_actual = en formacion (sin cerrar). vela_anterior = ultima cerrada, con patron detectado.",
+        "servicio": "PALMERO - Accion del Precio (SECURED)",
+        "nota": "endpoints protegidos con API key. Incluir header: Authorization: Bearer {PALMERO_API_KEY}",
     })
 
 
