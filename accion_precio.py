@@ -245,7 +245,9 @@ def precio_todos():
             except Exception as e:
                 resultado[symbol][label] = {"error": str(e)}
     return jsonify(resultado)
-
+@app.route("/precio/t/<bust>")
+def precio_nocache(bust):
+    return precio_todos()
 
 @app.route("/")
 def home():
